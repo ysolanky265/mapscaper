@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: matala-review-signals
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: KEY_ENCRYPTION_SECRET
+        sync: false
+      - key: DATABASE_SSL
+        value: "true"
