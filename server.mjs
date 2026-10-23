@@ -89,132 +89,151 @@ async function route(req,res){const u=new URL(req.url,'http://localhost');
  const sid=await requireAuth(req,res);if(!sid)return;
 
  if (req.method === 'POST' && u.pathname === '/api/business-finder') {
-   const input = await readBody(req);
-   const category = String(input.category || '').trim().toLowerCase();
-   const city = String(input.city || '').trim();
-   const country = String(input.country || '').trim().toUpperCase();
+  const input = await readBody(req);
+  const category = String(input.category || '').trim().toLowerCase();
+  const city = String(input.city || '').trim();
+  const country = String(input.country || '').trim().toUpperCase();
+  const countryName = { AU: 'Australia', NZ: 'New Zealand', US: 'United States' }[country];
 
-   if (!BUSINESS_TAGS[category]) {
-     return json(res, 400, { error: 'Choose a supported business category.' });
-   }
-   if (!city || city.length > 100 || /[<>\n\r]/.test(city)) {
-     return json(res, 400, { error: 'Enter a valid city.' });
-   }
-   if (!['AU', 'NZ', 'US'].includes(country)) {
-     return json(res, 400, { error: 'Choose Australia, New Zealand, or the United States.' });
-   }
+  if (!BUSINESS_TAGS[category]) return json(res, 400, { error: 'Choose a supported business category.' });
+  if (!city || city.length > 100 || /[<>\n\r]/.test(city)) return json(res, 400, { error: 'Enter a valid city.' });
+  if (!countryName) return json(res, 400, { error: 'Choose Australia, New Zealand, or the United States.' });
 
-   // Keep the existing per-session rate limit.
-   const now = Date.now();
-   const recent = (finderUsage.get(sid) || []).filter(t => now - t < 60000);
-   if (recent.length >= 5) {
-     return json(res, 429, { error: 'Search limit reached. Wait a minute and try again.' });
-   }
+  const now = Date.now();
+  const recent = (finderUsage.get(sid) || []).filter(t => now - t < 60000);
+  if (recent.length >= 5) return json(res, 429, { error: 'Search limit reached. Wait a minute and try again.' });
 
-   const cacheKey = `${country}|${category}|${city.toLowerCase()}`;
-   const cached = finderCache.get(cacheKey);
-   if (cached && now - cached.time < 6 * 60 * 60 * 1000) {
-     return json(res, 200, { ...cached.data, cached: true });
-   }
+  const cacheKey = `${country}|${category}|${city.toLowerCase()}`;
+  const cached = finderCache.get(cacheKey);
+  if (cached && now - cached.time < 6 * 60 * 60 * 1000) return json(res, 200, { ...cached.data, cached: true });
+  finderUsage.set(sid, recent.concat(now));
 
-   // Read the existing encrypted key. No key means no provider request.
-   const keyResult = await pool.query(
-     'SELECT encrypted_outscraper_key FROM app_settings WHERE id=$1',
-     ['workspace']
-   );
-   const encryptedKey = keyResult.rows[0]?.encrypted_outscraper_key;
-   if (!encryptedKey) {
-     return json(res, 400, {
-       error: 'Save your Outscraper API key in Settings before searching. Live searches may incur charges.'
-     });
-   }
+  try {
+    const categoryTerms = {
+      plumber: 'plumber',
+      plumbers: 'plumber',
+      restaurant: 'restaurant',
+      restaurants: 'restaurant',
+      dentist: 'dentist',
+      dentists: 'dentist',
+      cafe: 'cafe',
+      cafes: 'cafe',
+      hotel: 'hotel',
+      hotels: 'hotel',
+      electrician: 'electrician',
+      electricians: 'electrician',
+      bakery: 'bakery',
+      bakeries: 'bakery',
+      lawyer: 'lawyer',
+      lawyers: 'lawyer',
+      gym: 'gym',
+      gyms: 'gym',
+      salon: 'hairdresser beauty salon',
+      'beauty salon': 'beauty salon',
+      mechanic: 'car repair mechanic',
+      mechanics: 'car repair mechanic'
+    };
+    const term = categoryTerms[category] || category.replace(/[_-]+/g, ' ');
+    const query = `${term} ${city} ${countryName}`;
+    const photonUrl = new URL('https://photon.komoot.io/api/');
+    photonUrl.searchParams.set('q', query);
+    photonUrl.searchParams.set('limit', '30');
+    photonUrl.searchParams.set('lang', 'en');
 
-   let key;
-   try {
-     key = decrypt(encryptedKey);
-   } catch {
-     return json(res, 500, {
-       error: 'The saved Outscraper key could not be decrypted. Check the server encryption configuration.'
-     });
-   }
-   if (!key) {
-     return json(res, 400, {
-       error: 'No usable Outscraper API key is saved in Settings.'
-     });
-   }
+    const response = await fetch(photonUrl, {
+      headers: { 'User-Agent': 'MatalaBusinessFinder/0.1' },
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!response.ok) throw Error(`Free business search returned HTTP ${response.status}. Please try again later.`);
 
-   finderUsage.set(sid, recent.concat(now));
+    const payload = await response.json();
+    const seen = new Set();
 
-   try {
-     const countryName = {
-       AU: 'Australia',
-       NZ: 'New Zealand',
-       US: 'United States'
-     }[country];
+    // Prefer places whose OpenStreetMap tags match the selected category.
+    // Keep an explicit allow-list so text matches alone don't qualify suppliers.
+    const categoryRules = {
+      plumber: [['craft', 'plumber']],
+      electrician: [['craft', 'electrician']],
+      dentist: [['amenity', 'dentist']],
+      restaurant: [['amenity', 'restaurant']],
+      cafe: [['amenity', 'cafe']],
+      'auto repair': [['shop', 'car_repair']],
+      furniture: [['shop', 'furniture']],
+      'real estate': [['office', 'estate_agent']],
+      hairdresser: [['shop', 'hairdresser']],
+      gym: [['leisure', 'fitness_centre'], ['leisure', 'sports_centre']],
+      hotel: [['tourism', 'hotel']],
+      retailer: [['shop', 'yes']],
+      professional: [['office', 'yes']],
+      trades: [['craft', 'yes']]
+    };
 
-     const query = `${category}, ${city}, ${countryName}`;
-     const response = await providerJob('/google-maps-search', key, {
-       query,
-       limit: 20,
-       region: country,
-       language: 'en'
-     });
+    const rules = categoryRules[category] || [];
+    const features = payload.features || [];
+    const taggedMatches = features.filter(feature => {
+      const p = feature.properties || {};
+      return rules.some(([key, value]) =>
+        String(p.osm_key || '').toLowerCase() === key &&
+        String(p.osm_value || '').toLowerCase() === value
+      );
+    });
 
-     const seen = new Set();
-     const results = flattenData(response.data).map(place => {
-       const name = String(place.name || place.title || '').trim();
-       const address = String(
-         place.full_address || place.address || place.street_address || ''
-       ).trim();
-       const googleMapsUrl = String(
-         place.google_maps_url || place.googleMapsUrl || place.google_url || ''
-       ).trim();
-       const id = String(
-         place.place_id || place.google_id || googleMapsUrl || `${name}|${address}`
-       );
+    // If Photon has category-tagged results, prioritize those.
+    // If not, retain its text matches rather than returning an empty list.
+    const selectedFeatures = taggedMatches.length ? taggedMatches : features;
+    const results = selectedFeatures.map((feature, index) => {
+      const p = feature.properties || {};
+      const coords = feature.geometry?.coordinates || [];
+      const name = String(p.name || '').trim();
+      const tags = [p.osm_key, p.osm_value, p.type].filter(Boolean).join(' ').toLowerCase();
+      const address = [
+        p.housenumber && p.street ? `${p.housenumber} ${p.street}` : p.street,
+        p.district || p.suburb,
+        p.city || p.town || p.village,
+        p.state,
+        p.postcode,
+        countryName
+      ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      const id = p.osm_type && p.osm_id ? `${p.osm_type}/${p.osm_id}` : `${name.toLowerCase()}|${address.toLowerCase()}`;
 
-       return {
-         id,
-         name,
-         category: Array.isArray(place.category)
-           ? place.category.join(', ')
-           : String(place.category || place.type || category),
-         address,
-         phone: String(place.phone || place.phone_number || ''),
-         website: String(place.site || place.website || ''),
-         googleMapsUrl,
-         lat: Number(place.latitude ?? place.lat) || null,
-         lon: Number(place.longitude ?? place.lng ?? place.lon) || null,
-         rating: Number(place.rating) || null,
-         reviews: Number(place.reviews ?? place.reviews_count) || null
-       };
-     }).filter(place => {
-       if (!place.name || seen.has(place.id)) return false;
-       seen.add(place.id);
-       return true;
-     }).slice(0, 20);
+      return {
+        id: id || `photon-${index}`,
+        name,
+        category: tags || category,
+        address,
+        phone: String(
+          p.phone || p['contact:phone'] || p.telephone || ''
+        ).trim(),
+        website: String(
+          p.website || p['contact:website'] || p.url || ''
+        ).trim(),
+        googleMapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent([name, address].filter(Boolean).join(', '))}`,
+        lat: Number(coords[1]) || null,
+        lon: Number(coords[0]) || null,
+        rating: null,
+        reviews: null,
+        source: 'OpenStreetMap'
+      };
+    }).filter(p => {
+      if (!p.name || seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
+    }).slice(0, 20);
 
-     const data = {
-       results,
-       category,
-       city,
-       country,
-       source: 'Google Maps via Outscraper',
-       cached: false,
-       message: results.length
-         ? ''
-         : 'No named businesses were returned. Try another category or nearby city.'
-     };
+    const data = {
+      results, category, city, country, source: 'Photon / OpenStreetMap', cached: false,
+      message: results.length
+        ? 'Free OpenStreetMap-based listings. Ratings, review counts, phone numbers, and websites may be unavailable.'
+        : 'No matching named places found. Try a more specific category or nearby city.'
+    };
+    finderCache.set(cacheKey, { time: now, data });
+    return json(res, 200, data);
+  } catch (error) {
+    return json(res, 502, { error: safeError(error) || 'Free business search is unavailable. No paid provider was used.' });
+  }
+}
 
-     finderCache.set(cacheKey, { time: Date.now(), data });
-     return json(res, 200, data);
-   } catch (error) {
-     return json(res, 502, {
-       error: safeError(error) || 'Business search is temporarily unavailable.'
-     });
-   }
- }
- if(req.method==='GET'&&u.pathname==='/api/settings'){const r=await pool.query('SELECT encrypted_outscraper_key FROM app_settings WHERE id=$1',['workspace']);return json(res,200,{hasOutscraperKey:!!r.rows[0]?.encrypted_outscraper_key})}
+  if(req.method==='GET'&&u.pathname==='/api/settings'){const r=await pool.query('SELECT encrypted_outscraper_key FROM app_settings WHERE id=$1',['workspace']);return json(res,200,{hasOutscraperKey:!!r.rows[0]?.encrypted_outscraper_key})}
  if(req.method==='POST'&&u.pathname==='/api/settings/key'){const input=await readBody(req),key=String(input.apiKey||'').trim();if(key.length>500)return json(res,400,{error:'API key is too long.'});if(key){const enc=encrypt(key);await pool.query('INSERT INTO app_settings(id,encrypted_outscraper_key) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET encrypted_outscraper_key=EXCLUDED.encrypted_outscraper_key,updated_at=now()',['workspace',enc])}else{await pool.query('INSERT INTO app_settings(id,encrypted_outscraper_key) VALUES($1,NULL) ON CONFLICT(id) DO UPDATE SET encrypted_outscraper_key=NULL,updated_at=now()',['workspace'])}return json(res,200,{ok:true,hasOutscraperKey:!!key})}
  if(req.method==='POST'&&u.pathname==='/api/demo'){const j=makeDemoJob(randomUUID());j.phase='Complete';await saveJob(j);return json(res,201,{id:j.id})}
  if(req.method==='POST'&&u.pathname==='/api/jobs'){if (process.env.LIVE_SCANS_ENABLED !== 'true') {
